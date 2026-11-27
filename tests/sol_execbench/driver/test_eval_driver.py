@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 import pytest
+import torch
 
 import sol_execbench.driver as _driver_pkg
 
@@ -108,6 +109,7 @@ def _run_eval_driver(
     bench_config: Optional[dict] = None,
     extra_env: Optional[dict] = None,
     definition: Optional[dict] = None,
+    workload: dict | None = None,
 ) -> list[dict]:
     """Write all staging files and run eval_driver.py in a subprocess.
 
@@ -119,6 +121,7 @@ def _run_eval_driver(
             warnings on machines where clock locking is not available.
         extra_env: Additional environment variables for the subprocess.
         definition: Problem definition dict. Defaults to ``_MINIMAL_DEFINITION``.
+        workload: Workload dict. Defaults to ``_MINIMAL_WORKLOAD``.
 
     Returns:
         List of Trace dicts parsed from the driver's stdout.
@@ -127,7 +130,9 @@ def _run_eval_driver(
     (tmp_path / "definition.json").write_text(
         json.dumps(definition if definition is not None else _MINIMAL_DEFINITION)
     )
-    (tmp_path / "workload.jsonl").write_text(json.dumps(_MINIMAL_WORKLOAD))
+    (tmp_path / "workload.jsonl").write_text(
+        json.dumps(workload if workload is not None else _MINIMAL_WORKLOAD)
+    )
     (tmp_path / "solution.json").write_text(json.dumps(_SOLUTION_SPEC))
     (tmp_path / "kernel.py").write_text(kernel_code)
 
@@ -178,6 +183,45 @@ def test_passing_solution(tmp_path):
     assert ev["status"] == "PASSED", (
         f"Expected PASSED, got {ev['status']}; log={ev.get('log')}"
     )
+
+
+@pytest.mark.parametrize(
+    "name, transform, expected",
+    [
+        ("011_fp8_moe_gate_routing", "ids.flip(-1), weights.flip(-1)", "PASSED"),
+        ("011_fp8_moe_gate_routing", "ids.flip(-1), weights", "INCORRECT_NUMERICAL"),
+        ("other_router", "ids.flip(-1), weights.flip(-1)", "INCORRECT_NUMERICAL"),
+    ],
+)
+def test_only_fp8_router_checks_unordered_pairs(tmp_path, name, transform, expected):
+    if expected == "PASSED" and not torch.cuda.is_available():
+        pytest.skip("Passing driver cases require CUDA timing")
+    reference = (
+        "import torch\n"
+        "def run(logits):\n"
+        "    scores = logits.new_tensor([1., 2., 3., 4.]).expand_as(logits)\n"
+        "    weights, ids = scores.topk(2, sorted=False)\n"
+        "    return ids, weights / weights.sum(-1, keepdim=True)\n"
+    )
+    definition = {
+        "name": name,
+        "op_type": "moe",
+        "axes": {"n_routed_experts": {"type": "const", "value": 4}},
+        "inputs": {"logits": {"shape": ["1", "n_routed_experts"], "dtype": "float32"}},
+        "outputs": {
+            "ids": {"shape": ["1", "2"], "dtype": "int64"},
+            "weights": {"shape": ["1", "2"], "dtype": "float32"},
+        },
+        "reference": reference,
+    }
+    workload = {"axes": {}, "inputs": {"logits": {"type": "random"}}, "uuid": "router"}
+    kernel = reference.replace("def run(", "def route(") + (
+        f"def run(logits):\n    ids, weights = route(logits)\n    return {transform}\n"
+    )
+    traces = _run_eval_driver(
+        tmp_path, kernel, definition=definition, workload=workload
+    )
+    assert [trace["evaluation"]["status"] for trace in traces] == [expected], traces
 
 
 def test_monkey_patch_detected(tmp_path):

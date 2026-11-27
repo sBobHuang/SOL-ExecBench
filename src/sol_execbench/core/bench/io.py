@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.utils import dlpack
 
+from sol_execbench.core.bench.routing import FP8_MOE_ROUTER, non_saturating_inputs
 from sol_execbench.core.data import (
     Definition,
     Workload,
@@ -415,6 +416,8 @@ def gen_inputs(
     device: str,
     safe_tensors: Optional[Dict[str, torch.Tensor]] = None,
     custom_inputs_fn: Optional[Any] = None,
+    *,
+    correctness_case: bool = False,
 ) -> List[Any]:
     """Generate input tensors in definition order.
 
@@ -424,6 +427,7 @@ def gen_inputs(
     custom_inputs_fn: if provided, called each invocation to regenerate
         custom tensors instead of reusing *custom_tensors*.  Signature:
         ``(axes_and_scalars: dict, device: torch.device) -> dict[str, Tensor]``.
+    correctness_case: use non-saturating generated activations for the FP8 MoE router.
     """
     shapes = definition.get_input_shapes(workload.axes)
     dev = torch.device(device)
@@ -437,6 +441,13 @@ def gen_inputs(
             **workload.get_scalar_inputs(),
         }
         custom_tensors = custom_inputs_fn(axes_and_scalars, dev)
+        if (
+            correctness_case
+            and definition.name == FP8_MOE_ROUTER
+            and isinstance(workload.inputs.get("hidden_states"), CustomInput)
+            and isinstance(workload.inputs.get("scale_x"), CustomInput)
+        ):
+            custom_tensors = non_saturating_inputs(custom_tensors)
 
     for name, spec in definition.inputs.items():
         dtype = dtype_str_to_torch_dtype(spec.dtype)

@@ -779,6 +779,58 @@ class TestNormalizeOutputs:
 
 
 class TestGenInputs:
+    @pytest.mark.parametrize("case", ["routing", "other_definition", "fixture"])
+    def test_router_correctness_case(self, case):
+        name = "011_fp8_moe_gate_routing" if case != "other_definition" else "other"
+        definition = _make_definition(
+            name=name,
+            axes={
+                "tokens": {"type": "const", "value": 2},
+                "width": {"type": "const", "value": 256},
+                "blocks": {"type": "const", "value": 2},
+            },
+            inputs={
+                "hidden_states": {"shape": ["tokens", "width"], "dtype": "bfloat16"},
+                "scale_x": {"shape": ["tokens", "blocks"], "dtype": "float32"},
+            },
+            reference="def run(hidden_states, scale_x): return hidden_states",
+            outputs={"out": {"shape": ["tokens", "width"], "dtype": "bfloat16"}},
+        )
+        hidden = torch.zeros((2, 256), dtype=torch.bfloat16)
+        hidden[0, :128] = -16
+        hidden[1, 128:] = 64
+        maxima = torch.tensor([[16.0, 0.0], [0.0, 64.0]])
+        scales = (maxima / 448).clamp_min(1e-12)
+        tensors = {"hidden_states": hidden, "scale_x": scales}
+        workload = _make_workload(
+            axes={},
+            inputs={
+                key: {"type": "safetensors", "path": "s", "tensor_key": key}
+                if case == "fixture"
+                else {"type": "custom"}
+                for key in tensors
+            },
+        )
+
+        def generate(axes, device):
+            return tensors
+
+        args = definition, workload, "cpu", tensors, generate
+        actual, actual_scales = gen_inputs(*args, correctness_case=True)
+        if case == "routing":
+            torch.testing.assert_close(actual, hidden / 16, rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual_scales, (maxima / (16 * 448)).clamp_min(1e-12), rtol=0, atol=0
+            )
+        else:
+            torch.testing.assert_close(actual, hidden)
+            torch.testing.assert_close(actual_scales, scales)
+        original, original_scales = gen_inputs(*args)
+        assert original[1, -1].item() == 64
+        torch.testing.assert_close(
+            original_scales, (maxima / 448).clamp_min(1e-12), rtol=0, atol=0
+        )
+
     def test_random_input_has_correct_shape(self):
         d = _make_definition()
         wkl = _make_workload()  # N=4

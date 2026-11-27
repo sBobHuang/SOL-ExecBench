@@ -131,6 +131,7 @@ from sol_execbench.core.bench.reward_hack import (  # noqa: E402
     check_thread_injection,
     snapshot_critical_functions,
 )
+from sol_execbench.core.bench.routing import FP8_MOE_ROUTER, compare_routing  # noqa: E402
 from sol_execbench.core.bench.timing import time_runnable  # noqa: E402
 from sol_execbench.core.bench.utils import (  # noqa: E402
     make_eval,
@@ -188,6 +189,7 @@ if ref_fn is None:
 _CRITICAL_NAMES = [
     "time_runnable",
     "compute_error_stats",
+    "compare_routing",
     "check_monkey_patch",
     "check_lazy_outputs",
     "check_thread_injection",
@@ -428,6 +430,7 @@ for _workload in workloads:
                 device=_device,
                 safe_tensors=_safe_tensors or None,
                 custom_inputs_fn=_custom_inputs_fn,
+                correctness_case=(_round == 1),
             )
         except Exception as _e:
             _emit(
@@ -545,8 +548,21 @@ for _workload in workloads:
 
         # -- Numerical correctness check (every round) --
         _numerically_wrong = False
-        for _ref_out, _usr_out in zip(_ref_outputs, _user_outputs):
-            _c, _exceeds = compute_error_stats(_usr_out, _ref_out, _workload.tolerance)
+        if definition.name == FP8_MOE_ROUTER:
+            _checks = (
+                compare_routing(
+                    _user_outputs,
+                    _ref_outputs,
+                    _workload.tolerance,
+                    _resolved_axes["n_routed_experts"],
+                ),
+            )
+        else:
+            _checks = (
+                compute_error_stats(_usr_out, _ref_out, _workload.tolerance)
+                for _ref_out, _usr_out in zip(_ref_outputs, _user_outputs)
+            )
+        for _c, _exceeds in _checks:
             if _c.max_absolute_error > _correctness.max_absolute_error:
                 _correctness = _c
             if _c.has_nan:
@@ -554,6 +570,8 @@ for _workload in workloads:
             elif _c.has_inf and not _correctness.has_nan:
                 _correctness = _c
             if _exceeds:
+                if definition.name == FP8_MOE_ROUTER:
+                    _correctness = _c
                 _numerically_wrong = True
                 break
 
